@@ -1,7 +1,7 @@
 """
 PDF utilities: splitting chapters, extracting text/images, generating summary PDFs.
 
-Uses PyMuPDF for reading and fpdf2 for writing summary PDFs.
+Uses PyMuPDF for reading and markdown + xhtml2pdf for writing summary PDFs.
 """
 
 from __future__ import annotations
@@ -9,8 +9,9 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import markdown
 import pymupdf
-from fpdf import FPDF
+from xhtml2pdf import pisa
 
 from .chapter_detector import Chapter
 
@@ -141,81 +142,200 @@ def extract_chapter_text(
 
 
 # ---------------------------------------------------------------------------
-# PDF summary generation
+# PDF summary generation via markdown -> HTML -> xhtml2pdf
 # ---------------------------------------------------------------------------
 
-
-def _sanitize_for_helvetica(text: str) -> str:
-    """Replace unicode characters that Helvetica can't render."""
-    replacements = {
-        "\u2014": "--",   # em dash
-        "\u2013": "-",    # en dash
-        "\u2010": "-",    # hyphen
-        "\u2018": "'",    # left single quote
-        "\u2019": "'",    # right single quote
-        "\u201c": '"',    # left double quote
-        "\u201d": '"',    # right double quote
-        "\u2022": "-",    # bullet
-        "\u2026": "...",  # ellipsis
-        "\u00a0": " ",    # non-breaking space
-        "\u2011": "-",    # non-breaking hyphen
-        "\u200b": "",     # zero-width space
-        "\u2212": "-",    # minus sign
-        "\u00b7": "-",    # middle dot
+# CSS stylesheet for rendered PDFs
+_PDF_CSS = """
+@page {
+    size: A4;
+    margin: 2cm 2.5cm;
+    @frame footer {
+        -pdf-frame-content: footerContent;
+        bottom: 0.5cm;
+        margin-left: 2.5cm;
+        margin-right: 2.5cm;
+        height: 1cm;
     }
-    for char, replacement in replacements.items():
-        text = text.replace(char, replacement)
-    # Fallback: replace any remaining non-latin1 chars
-    return text.encode("latin-1", errors="replace").decode("latin-1")
+}
+
+body {
+    font-family: Helvetica, Arial, sans-serif;
+    font-size: 11px;
+    line-height: 1.5;
+    color: #1a1a1a;
+}
+
+h1 {
+    font-size: 20px;
+    color: #111;
+    margin-top: 18px;
+    margin-bottom: 8px;
+    border-bottom: 2px solid #333;
+    padding-bottom: 4px;
+}
+
+h2 {
+    font-size: 16px;
+    color: #222;
+    margin-top: 14px;
+    margin-bottom: 6px;
+    border-bottom: 1px solid #aaa;
+    padding-bottom: 3px;
+}
+
+h3 {
+    font-size: 13px;
+    color: #333;
+    margin-top: 10px;
+    margin-bottom: 4px;
+}
+
+p {
+    margin-top: 4px;
+    margin-bottom: 4px;
+}
+
+ul, ol {
+    margin-top: 4px;
+    margin-bottom: 4px;
+    padding-left: 20px;
+}
+
+li {
+    margin-bottom: 2px;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 8px;
+    margin-bottom: 8px;
+    font-size: 10px;
+}
+
+th {
+    background-color: #2c3e50;
+    color: #ffffff;
+    padding: 6px 8px;
+    text-align: left;
+    border: 1px solid #2c3e50;
+    font-weight: bold;
+}
+
+td {
+    padding: 5px 8px;
+    border: 1px solid #ddd;
+    vertical-align: top;
+}
+
+tr:nth-child(even) td {
+    background-color: #f7f7f7;
+}
+
+code {
+    font-family: Courier, monospace;
+    font-size: 10px;
+    background-color: #f0f0f0;
+    padding: 1px 3px;
+}
+
+pre {
+    background-color: #f4f4f4;
+    border: 1px solid #ddd;
+    padding: 10px;
+    font-family: Courier, monospace;
+    font-size: 10px;
+    line-height: 1.4;
+    margin-top: 6px;
+    margin-bottom: 6px;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+}
+
+hr {
+    border: none;
+    border-top: 1px solid #ccc;
+    margin: 10px 0;
+}
+
+strong {
+    font-weight: bold;
+}
+
+em {
+    font-style: italic;
+}
+
+blockquote {
+    border-left: 3px solid #ccc;
+    padding-left: 10px;
+    margin-left: 0;
+    color: #555;
+    font-style: italic;
+}
+
+.title-block {
+    text-align: center;
+    margin-bottom: 20px;
+}
+
+.title-block h1 {
+    font-size: 24px;
+    border: none;
+    margin-bottom: 4px;
+}
+
+.title-block h2 {
+    font-size: 16px;
+    color: #555;
+    border: none;
+    font-weight: normal;
+}
+
+.separator {
+    border-top: 2px solid #333;
+    margin: 15px 0;
+}
+"""
+
+# Markdown extensions to enable
+_MD_EXTENSIONS = [
+    "tables",
+    "fenced_code",
+    "codehilite",
+    "toc",
+    "nl2br",
+    "sane_lists",
+]
+
+_MD_EXTENSION_CONFIGS = {
+    "codehilite": {
+        "css_class": "code",
+        "noclasses": True,
+    },
+}
 
 
-def _is_numbered_list(text: str) -> bool:
-    """Check if text starts with a numbered list pattern like '1.', '10.'."""
-    return bool(re.match(r"^\d+\.\s", text))
+def _markdown_to_html(text: str) -> str:
+    """Convert markdown text to HTML using the markdown library."""
+    return markdown.markdown(
+        text,
+        extensions=_MD_EXTENSIONS,
+        extension_configs=_MD_EXTENSION_CONFIGS,
+    )
 
 
-def _render_markdown_body(pdf: FPDF, text: str, left: float, width: float) -> None:
-    """Render markdown-formatted text into an FPDF document.
-
-    Supports: headings (#, ##, ###), bullet points (-, *), numbered lists.
-    """
-    for line in text.split("\n"):
-        stripped = line.strip()
-
-        if not stripped:
-            pdf.ln(5)
-            continue
-
-        stripped = _sanitize_for_helvetica(stripped)
-        pdf.set_x(left)
-
-        # Heading detection (most specific first)
-        if stripped.startswith("### "):
-            pdf.set_font("Helvetica", "B", 12)
-            pdf.multi_cell(width, 7, text=stripped[4:])
-            pdf.set_font("Helvetica", "", 11)
-            pdf.ln(2)
-        elif stripped.startswith("## "):
-            pdf.set_font("Helvetica", "B", 14)
-            pdf.multi_cell(width, 7, text=stripped[3:])
-            pdf.set_font("Helvetica", "", 11)
-            pdf.ln(2)
-        elif stripped.startswith("# "):
-            pdf.set_font("Helvetica", "B", 16)
-            pdf.multi_cell(width, 8, text=stripped[2:])
-            pdf.set_font("Helvetica", "", 11)
-            pdf.ln(3)
-        elif stripped.startswith(("- ", "* ")):
-            bullet_text = stripped[2:]
-            indent = 8
-            pdf.set_x(left + indent)
-            pdf.multi_cell(width - indent, 6, text=f"- {bullet_text}")
-        elif _is_numbered_list(stripped):
-            indent = 8
-            pdf.set_x(left + indent)
-            pdf.multi_cell(width - indent, 6, text=stripped)
-        else:
-            pdf.multi_cell(width, 6, text=stripped)
+def _html_to_pdf(html: str, output_path: Path) -> Path:
+    """Convert an HTML string to a PDF file using xhtml2pdf."""
+    with open(output_path, "wb") as f:
+        pisa_status = pisa.CreatePDF(html, dest=f)
+    if pisa_status.err:
+        raise RuntimeError(
+            f"xhtml2pdf failed with {pisa_status.err} error(s) "
+            f"generating {output_path}"
+        )
+    return output_path
 
 
 def create_summary_pdf(
@@ -225,42 +345,25 @@ def create_summary_pdf(
     output_path: Path,
 ) -> Path:
     """Generate a PDF from a chapter summary text."""
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=20)
-    pdf.add_page()
+    body_html = _markdown_to_html(summary_text)
 
-    left = pdf.l_margin
-    effective_width = pdf.w - pdf.l_margin - pdf.r_margin
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <style>{_PDF_CSS}</style>
+</head>
+<body>
+    <div class="title-block">
+        <h1>{_escape_html(book_title)}</h1>
+        <h2>Summary: {_escape_html(chapter_title)}</h2>
+    </div>
+    <div class="separator"></div>
+    {body_html}
+</body>
+</html>"""
 
-    # Title
-    pdf.set_font("Helvetica", "B", 18)
-    pdf.set_x(left)
-    pdf.multi_cell(
-        effective_width, 10,
-        text=_sanitize_for_helvetica(book_title), align="C",
-    )
-    pdf.ln(5)
-
-    # Chapter title
-    pdf.set_font("Helvetica", "B", 14)
-    pdf.set_x(left)
-    pdf.multi_cell(
-        effective_width, 8,
-        text=_sanitize_for_helvetica(f"Summary: {chapter_title}"), align="C",
-    )
-    pdf.ln(5)
-
-    # Separator line
-    pdf.set_draw_color(100, 100, 100)
-    pdf.line(20, pdf.get_y(), pdf.w - 20, pdf.get_y())
-    pdf.ln(10)
-
-    # Summary body
-    pdf.set_font("Helvetica", "", 11)
-    _render_markdown_body(pdf, summary_text, left, effective_width)
-
-    pdf.output(str(output_path))
-    return output_path
+    return _html_to_pdf(html, output_path)
 
 
 def create_compiled_summary_pdf(
@@ -269,44 +372,35 @@ def create_compiled_summary_pdf(
     output_path: Path,
 ) -> Path:
     """Generate a compiled full-book summary PDF."""
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=20)
-    pdf.add_page()
+    body_html = _markdown_to_html(summary_text)
 
-    left = pdf.l_margin
-    effective_width = pdf.w - pdf.l_margin - pdf.r_margin
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <style>{_PDF_CSS}</style>
+</head>
+<body>
+    <div class="title-block">
+        <h1>{_escape_html(book_title)}</h1>
+        <h2>Complete Book Summary</h2>
+    </div>
+    <div class="separator"></div>
+    {body_html}
+</body>
+</html>"""
 
-    # Title block
-    pdf.set_font("Helvetica", "B", 20)
-    pdf.set_x(left)
-    pdf.multi_cell(
-        effective_width, 10,
-        text=_sanitize_for_helvetica(book_title), align="C",
+    return _html_to_pdf(html, output_path)
+
+
+def _escape_html(text: str) -> str:
+    """Escape HTML special characters in text."""
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
     )
-    pdf.ln(3)
-
-    pdf.set_font("Helvetica", "B", 14)
-    pdf.set_x(left)
-    pdf.multi_cell(effective_width, 8, text="Complete Book Summary", align="C")
-    pdf.ln(5)
-
-    # Double separator
-    y = pdf.get_y()
-    pdf.set_draw_color(60, 60, 60)
-    pdf.set_line_width(0.8)
-    pdf.line(20, y, pdf.w - 20, y)
-    pdf.ln(2)
-    y2 = pdf.get_y()
-    pdf.set_line_width(0.3)
-    pdf.line(20, y2, pdf.w - 20, y2)
-    pdf.ln(10)
-
-    # Body
-    pdf.set_font("Helvetica", "", 11)
-    _render_markdown_body(pdf, summary_text, left, effective_width)
-
-    pdf.output(str(output_path))
-    return output_path
 
 
 def get_book_metadata(doc: pymupdf.Document, pdf_path: Path) -> dict:
