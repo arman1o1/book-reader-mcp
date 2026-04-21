@@ -15,20 +15,28 @@ MCP server that splits PDF books into chapters and serves them to LLMs for summa
 - **Auto-resume** — detects completed summaries so interrupted workflows continue seamlessly
 - **Full-text search** — search across all chapters with context snippets
 - **Smart filtering** — auto-skips non-content sections (TOC, Copyright, Index, Glossary, etc.)
+- **Organized folders** — `books/` for input PDFs, `books_summarized/` for structured output
 
-## Output Structure
+## Folder Structure
 
 ```
-Book_Title/
-├── 00_complete_book_summary.pdf       # compiled book summary
-├── chapter_01_introduction.pdf         # extracted chapter PDF
-├── chapter_01_introduction_summary.pdf # LLM-generated summary
-├── chapter_02_foundations.pdf
-├── chapter_02_foundations_summary.pdf
-├── ...
-└── images/
-    ├── ch01_img_01.png                 # extracted figures
-    └── ch02_img_01.png
+project_root/
+├── books/                                  # Drop PDF books here
+│   ├── AI Agents in Action.pdf
+│   └── Supply and Demand Trading.pdf
+├── books_summarized/                       # Structured output per book
+│   └── ai_agents_in_action/
+│       ├── chapters/                       # Extracted chapter PDFs
+│       │   ├── chapter_01_introduction.pdf
+│       │   └── chapter_02_foundations.pdf
+│       ├── summaries/                      # LLM-generated summary PDFs
+│       │   ├── chapter_01_introduction_summary.pdf
+│       │   └── chapter_02_foundations_summary.pdf
+│       ├── images/                         # Extracted figures
+│       │   ├── ch01_img_01.png
+│       │   └── ch02_img_01.png
+│       └── 00_complete_book_summary.pdf    # Compiled book summary
+└── src/book_reader_mcp/
 ```
 
 ## Installation
@@ -105,7 +113,8 @@ Edit your MCP config (`mcp_config.json` or `settings.json`):
 
 | Tool | Description |
 |------|-------------|
-| `load_book(pdf_path, output_dir?)` | Load PDF, detect chapters, split into chapter PDFs, extract images |
+| `list_books()` | List available PDFs in the `books/` folder with index numbers |
+| `load_book(pdf_path, output_dir?)` | Load PDF by index, name, or path. Detects chapters, splits PDFs, extracts images |
 | `list_chapters()` | List detected chapters with page ranges, image counts, and content flags |
 | `get_chapter_text(chapter_index)` | Get full text of a chapter (1-based index) with `[IMAGE]` markers |
 | `save_chapter_summary(chapter_index, summary_text)` | Save markdown summary as formatted PDF |
@@ -118,18 +127,30 @@ Edit your MCP config (`mcp_config.json` or `settings.json`):
 
 Tell your LLM:
 
-> "Load the book at C:/path/to/book.pdf and summarize each chapter."
+> "Summarize book 1" or "Summarize the Supply and Demand book"
 
 The LLM will call the tools in sequence:
 
 ```
-1. load_book("C:/path/to/book.pdf")     → detects chapters, splits PDFs
-2. get_summary_status()                   → checks for completed summaries
-3. get_chapter_text(1)                    → extracts chapter 1 text
-4. [LLM generates summary]
-5. save_chapter_summary(1, summary)       → saves as PDF
-6. ... repeats for each chapter ...
-7. compile_book_summary(full_synthesis)   → saves combined summary
+1. list_books()                           → shows available books
+2. load_book("1")                         → loads by index, detects chapters
+3. get_summary_status()                   → checks for completed summaries
+4. get_chapter_text(1)                    → extracts chapter 1 text
+5. [LLM generates summary]
+6. save_chapter_summary(1, summary)       → saves to summaries/ folder
+7. ... repeats for each chapter ...
+8. compile_book_summary(full_synthesis)   → saves combined summary
+```
+
+### Loading Books
+
+`load_book` accepts multiple input formats:
+
+```
+load_book("1")                    → book index from list_books
+load_book("Supply and Demand")    → partial name match in books/
+load_book("mybook.pdf")           → filename in books/
+load_book("C:/full/path.pdf")     → absolute path (backward compatible)
 ```
 
 ## Chapter Detection

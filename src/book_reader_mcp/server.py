@@ -5,7 +5,12 @@ Splits PDF books into chapters, extracts text for LLM summarization,
 and saves summaries as formatted PDFs. No LLM baked in — your MCP
 client's model does the thinking.
 
+Folder convention:
+    books/              — Drop PDF books here
+    books_summarized/   — Structured output per book
+
 Tools:
+    list_books         — List available PDFs in books/ folder
     load_book          — Load a PDF, detect chapters, split into chapter PDFs
     list_chapters      — List detected chapters with page ranges and metadata
     get_chapter_text   — Get full text of one chapter (1-based index)
@@ -62,15 +67,23 @@ def _is_content_chapter(chapter: Chapter) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Project directory convention
+# ---------------------------------------------------------------------------
+_PROJECT_ROOT = Path.cwd()
+_BOOKS_DIR = _PROJECT_ROOT / "books"
+_SUMMARIES_DIR = _PROJECT_ROOT / "books_summarized"
+
+# ---------------------------------------------------------------------------
 # Server state
 # ---------------------------------------------------------------------------
 mcp = FastMCP(
     "book-reader",
     instructions=(
         "PDF book reader that splits books into chapters for summarization. "
-        "Workflow: 1) load_book → 2) list_chapters → 3) get_chapter_text for "
-        "each chapter → 4) summarize with your LLM → 5) save_chapter_summary "
-        "for each. Process ONE chapter at a time to avoid blowing context."
+        "Workflow: 1) list_books → 2) load_book → 3) list_chapters → "
+        "4) get_chapter_text for each chapter → 5) summarize with your LLM → "
+        "6) save_chapter_summary for each. Process ONE chapter at a time to "
+        "avoid blowing context."
     ),
 )
 
@@ -79,6 +92,8 @@ _state: dict = {
     "doc": None,
     "chapters": [],
     "book_dir": None,
+    "chapters_dir": None,
+    "summaries_dir": None,
     "book_title": "",
     "pdf_path": None,
     "chapter_images": {},
@@ -92,8 +107,93 @@ def _ensure_book_loaded() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _resolve_pdf_path(pdf_path: str) -> Path:
+    """Resolve a PDF path from index, name, or absolute path.
+
+    Resolution order:
+    1. Digit → 1-based index from books/ folder (sorted)
+    2. Non-absolute string → filename or stem lookup in books/
+    3. Absolute path → use directly (backward compat)
+    """
+    stripped = pdf_path.strip()
+
+    # 1. Numeric index
+    if stripped.isdigit():
+        _BOOKS_DIR.mkdir(exist_ok=True)
+        pdfs = sorted(_BOOKS_DIR.glob("*.pdf"))
+        idx = int(stripped) - 1
+        if idx < 0 or idx >= len(pdfs):
+            raise ValueError(
+                f"Book index {stripped} out of range. "
+                f"Available: 1-{len(pdfs)}. Use list_books to see options."
+            )
+        return pdfs[idx]
+
+    path = Path(stripped)
+
+    # 2. If not absolute, look in books/
+    if not path.is_absolute():
+        # Try as exact filename first
+        candidate = _BOOKS_DIR / stripped
+        if candidate.exists():
+            return candidate
+        # Try adding .pdf extension
+        if not stripped.lower().endswith(".pdf"):
+            candidate = _BOOKS_DIR / (stripped + ".pdf")
+            if candidate.exists():
+                return candidate
+        # Fuzzy: search for stem match
+        for p in _BOOKS_DIR.glob("*.pdf"):
+            if stripped.lower() in p.stem.lower():
+                return p
+        raise FileNotFoundError(
+            f"No PDF matching '{stripped}' found in {_BOOKS_DIR}. "
+            f"Use list_books to see available books."
+        )
+
+    # 3. Absolute path — use directly
+    if not path.exists():
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+    return path
+
+
+# ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def list_books() -> str:
+    """
+    List available PDF books in the books/ folder.
+
+    Returns an indexed list of books. Use the index or filename
+    with load_book to load a specific book.
+
+    Returns:
+        JSON with books directory path, count, and book details.
+    """
+    _BOOKS_DIR.mkdir(exist_ok=True)
+    pdfs = sorted(_BOOKS_DIR.glob("*.pdf"))
+    books = []
+    for i, p in enumerate(pdfs, 1):
+        size_mb = round(p.stat().st_size / (1024 * 1024), 2)
+        books.append({
+            "index": i,
+            "name": p.stem,
+            "file": p.name,
+            "size_mb": size_mb,
+        })
+
+    return json.dumps({
+        "books_dir": str(_BOOKS_DIR),
+        "count": len(books),
+        "books": books,
+    }, indent=2)
 
 
 @mcp.tool()
@@ -106,18 +206,19 @@ def load_book(pdf_path: str, output_dir: str = "") -> str:
     into individual chapter PDFs, and extracts images.
 
     Args:
-        pdf_path: Absolute path to the PDF book file.
-        output_dir: Directory to save chapter PDFs. Defaults to a folder named
-                     after the book in the same directory as the PDF.
+        pdf_path: Path to the PDF. Accepts:
+                  - A number (e.g. "2") → index from list_books
+                  - A filename or partial name → looked up in books/ folder
+                  - An absolute path → used directly (backward compatible)
+        output_dir: Directory to save output. Defaults to
+                     books_summarized/<book_name>/.
 
     Returns:
         JSON with book metadata, detected chapters, and output paths.
     """
-    path = Path(pdf_path)
-    if not path.exists():
-        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+    path = _resolve_pdf_path(pdf_path)
     if not path.suffix.lower() == ".pdf":
-        raise ValueError(f"Not a PDF file: {pdf_path}")
+        raise ValueError(f"Not a PDF file: {path}")
 
     # Close previous book if any
     if _state["doc"] is not None:
@@ -134,9 +235,18 @@ def load_book(pdf_path: str, output_dir: str = "") -> str:
     if output_dir:
         book_dir = Path(output_dir)
     else:
-        book_dir = path.parent / sanitize_filename(book_title)
+        _SUMMARIES_DIR.mkdir(parents=True, exist_ok=True)
+        book_dir = _SUMMARIES_DIR / sanitize_filename(book_title)
 
     book_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create structured subdirectories
+    chapters_dir = book_dir / "chapters"
+    summaries_dir = book_dir / "summaries"
+    images_dir = book_dir / "images"
+    chapters_dir.mkdir(exist_ok=True)
+    summaries_dir.mkdir(exist_ok=True)
+    images_dir.mkdir(exist_ok=True)
 
     # Detect chapters
     chapters = detect_chapters(doc)
@@ -148,7 +258,7 @@ def load_book(pdf_path: str, output_dir: str = "") -> str:
     for ch in chapters:
         safe_title = sanitize_filename(ch.title)
         filename = f"chapter_{ch.index + 1:02d}_{safe_title}.pdf"
-        ch_path = book_dir / filename
+        ch_path = chapters_dir / filename
         split_chapter_to_pdf(doc, ch, ch_path)
         chapter_files.append(str(ch_path))
 
@@ -161,6 +271,8 @@ def load_book(pdf_path: str, output_dir: str = "") -> str:
     _state["doc"] = doc
     _state["chapters"] = chapters
     _state["book_dir"] = book_dir
+    _state["chapters_dir"] = chapters_dir
+    _state["summaries_dir"] = summaries_dir
     _state["book_title"] = book_title
     _state["pdf_path"] = path
     _state["chapter_images"] = chapter_images
@@ -177,6 +289,8 @@ def load_book(pdf_path: str, output_dir: str = "") -> str:
         "status": "loaded",
         "metadata": metadata,
         "output_directory": str(book_dir),
+        "chapters_directory": str(chapters_dir),
+        "summaries_directory": str(summaries_dir),
         "chapters_detected": len(chapters),
         "chapters": chapters_info,
         "chapter_pdfs": chapter_files,
@@ -298,11 +412,11 @@ def save_chapter_summary(chapter_index: int, summary_text: str) -> str:
         )
 
     chapter = chapters[idx]
-    book_dir: Path = _state["book_dir"]
+    summaries_dir: Path = _state["summaries_dir"]
 
     safe_title = sanitize_filename(chapter.title)
     filename = f"chapter_{chapter_index:02d}_{safe_title}_summary.pdf"
-    output_path = book_dir / filename
+    output_path = summaries_dir / filename
 
     create_summary_pdf(
         summary_text=summary_text,
@@ -358,6 +472,7 @@ def get_summary_status() -> str:
     """
     _ensure_book_loaded()
 
+    summaries_dir: Path = _state["summaries_dir"]
     book_dir: Path = _state["book_dir"]
     chapters: list[Chapter] = _state["chapters"]
 
@@ -366,7 +481,13 @@ def get_summary_status() -> str:
     for ch in chapters:
         ch_index = ch.index + 1  # 1-based
         safe_title = sanitize_filename(ch.title)
-        expected = book_dir / f"chapter_{ch_index:02d}_{safe_title}_summary.pdf"
+        summary_name = f"chapter_{ch_index:02d}_{safe_title}_summary.pdf"
+        # Check summaries/ subdir first, then book_dir for backward compat
+        expected = summaries_dir / summary_name
+        if not expected.exists():
+            legacy = book_dir / summary_name
+            if legacy.exists():
+                expected = legacy
         is_done = expected.exists()
         if is_done:
             completed += 1
@@ -499,40 +620,55 @@ def summarize_book(pdf_path: str) -> str:
 
     Provides step-by-step instructions for the LLM to follow.
     """
-    return f"""You are summarizing a PDF book chapter by chapter. Follow these steps EXACTLY:
-
-## Step 1: Load the book
-Call load_book with pdf_path="{pdf_path}"
-Note the number of chapters and their titles.
-
-## Step 2: Check progress
-Call get_summary_status() to see which chapters are already done.
-Skip completed chapters.
-
-## Step 3: Process each pending content chapter sequentially
-For each content chapter (skip non-content chapters like Copyright, TOC, Index):
-
-1. Call get_chapter_text(chapter_index) to get the full text
-2. Read the text carefully and write a COMPREHENSIVE summary that includes:
-   - An overview of the chapter's main theme (2-3 sentences)
-   - All key concepts explained clearly
-   - Important frameworks, models, or methodologies discussed
-   - Practical takeaways and actionable insights
-   - Code examples or tools mentioned (with brief descriptions)
-   - How this chapter connects to the broader book narrative
-3. Format the summary with markdown headings (#, ##, ###), bullet points (-), and numbered lists
-4. Call save_chapter_summary(chapter_index, summary_text) to save as PDF
-
-## Step 4: After all chapters are done
-Write a full-book synthesis and call compile_book_summary(summary_text).
-
-IMPORTANT RULES:
-- Process ONE chapter at a time to avoid context overflow
-- Do NOT skip any content — be comprehensive but concise (no fluff)
-- If a chapter has [IMAGE] markers, note what the figure likely shows based on surrounding text
-- Each summary should be self-contained — readable without the original chapter
-- Start now with Step 1.
-"""
+    return (  # noqa: E501
+        "You are summarizing a PDF book chapter by chapter. "
+        "Follow these steps EXACTLY:\n\n"
+        "## Step 1: Find and load the book\n"
+        "Call list_books() to see available books in the "
+        "books/ folder.\n"
+        f"Then call load_book with pdf_path=\"{pdf_path}\"\n"
+        "(You can pass a number index, filename, or partial "
+        "name.)\n"
+        "Note the number of chapters and their titles.\n\n"
+        "## Step 2: Check progress\n"
+        "Call get_summary_status() to see which chapters are "
+        "already done.\nSkip completed chapters.\n\n"
+        "## Step 3: Process each pending content chapter "
+        "sequentially\n"
+        "For each content chapter (skip non-content chapters "
+        "like Copyright, TOC, Index):\n\n"
+        "1. Call get_chapter_text(chapter_index) to get the "
+        "full text\n"
+        "2. Read the text carefully and write a COMPREHENSIVE "
+        "summary that includes:\n"
+        "   - An overview of the chapter's main theme "
+        "(2-3 sentences)\n"
+        "   - All key concepts explained clearly\n"
+        "   - Important frameworks, models, or methodologies "
+        "discussed\n"
+        "   - Practical takeaways and actionable insights\n"
+        "   - Code examples or tools mentioned "
+        "(with brief descriptions)\n"
+        "   - How this chapter connects to the broader book "
+        "narrative\n"
+        "3. Format the summary with markdown headings "
+        "(#, ##, ###), bullet points (-), and numbered lists\n"
+        "4. Call save_chapter_summary(chapter_index, "
+        "summary_text) to save as PDF\n\n"
+        "## Step 4: After all chapters are done\n"
+        "Write a full-book synthesis and call "
+        "compile_book_summary(summary_text).\n\n"
+        "IMPORTANT RULES:\n"
+        "- Process ONE chapter at a time to avoid context "
+        "overflow\n"
+        "- Do NOT skip any content — be comprehensive but "
+        "concise (no fluff)\n"
+        "- If a chapter has [IMAGE] markers, note what the "
+        "figure likely shows based on surrounding text\n"
+        "- Each summary should be self-contained — readable "
+        "without the original chapter\n"
+        "- Start now with Step 1.\n"
+    )
 
 
 # ---------------------------------------------------------------------------
