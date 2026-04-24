@@ -33,7 +33,8 @@ def sanitize_filename(name: str) -> str:
     # Replace whitespace with underscores
     clean = re.sub(r"\s+", "_", clean.strip())
     # Truncate to reasonable length
-    return clean[:80].lower()
+    clean = clean[:80].lower()
+    return clean if clean else "untitled"
 
 
 def split_chapter_to_pdf(
